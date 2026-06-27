@@ -1,0 +1,86 @@
+{
+    "nodes": [
+        {
+            "name": "GitHub",
+            "category": "工具概念"
+        },
+        {
+            "name": "人工智能",
+            "category": "专业学术名词"
+        },
+        {
+            "name": "Advanced Computing",
+            "category": "计算机技术"
+        },
+        {
+            "name": "手眼矩阵",
+            "category": "计算机视觉"
+        },
+        {
+            "name": "点云滤波",
+            "category": "点云处理"
+        },
+        {
+            "name": "力控算法",
+            "category": "机器人控制技术"
+        },
+        {
+            "name": "视觉伺服",
+            "category": "机器人视觉技术"
+        },
+        {
+            "name": "汪淼",
+            "category": "核心人物"
+        },
+        {
+            "name": "常伟思",
+            "category": "军方高层"
+        },
+        {
+            "name": "杨冬",
+            "category": "自杀科学家"
+        },
+        {
+            "name": "自杀名单",
+            "category": "核心线索"
+        }
+    ],
+    "edges": [
+        {
+            "source": "GitHub",
+            "target": "人工智能"
+        },
+        {
+            "source": "人工智能",
+            "target": "Advanced Computing"
+        },
+        {
+            "source": "Advanced Computing",
+            "target": "手眼矩阵"
+        },
+        {
+            "source": "手眼矩阵",
+            "target": "点云滤波"
+        },
+        {
+            "source": "点云滤波",
+            "target": "力控算法"
+        },
+        {
+            "source": "力控算法",
+            "target": "视觉伺服"
+        },
+        {
+            "source": "汪淼",
+            "target": "常伟思"
+        },
+        {
+            "source": "常伟思",
+            "target": "杨冬"
+        },
+        {
+            "source": "杨冬",
+            "target": "自杀名单"
+        }
+    ]
+}

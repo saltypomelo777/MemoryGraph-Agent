@@ -1,0 +1,532 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: semantic version bump for this release
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: validate release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_REF}" in
+            refs/heads/main)
+              echo "publishing release from main"
+              ;;
+            refs/heads/fix/release-*)
+              echo "test release run from ${GITHUB_REF}; publish job will be skipped"
+              ;;
+            *)
+              echo "releases must be dispatched from main or fix/release-*; current ref is ${GITHUB_REF}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: record release base commit
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          echo "base_sha=${base_sha}"
+          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: calculate next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          latest_tag="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+
+          if [ -n "${latest_tag}" ]; then
+            base_version="${latest_tag#v}"
+            previous_tag="${latest_tag}"
+          else
+            base_version="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          print(json.loads(Path('app/src-tauri/tauri.conf.json').read_text())['version'])
+          PY
+          )"
+            previous_tag=""
+          fi
+
+          if [[ ! "${base_version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "base version must be strict MAJOR.MINOR.PATCH semver, got: ${base_version}" >&2
+            exit 1
+          fi
+
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+
+          case "${{ inputs.release_type }}" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            patch)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "unsupported release type: ${{ inputs.release_type }}" >&2
+              exit 1
+              ;;
+          esac
+
+          version="${major}.${minor}.${patch}"
+          tag="v${version}"
+
+          if git rev-parse "${tag}" >/dev/null 2>&1; then
+            echo "tag ${tag} already exists" >&2
+            exit 1
+          fi
+
+          echo "base_version=${base_version}"
+          echo "previous_tag=${previous_tag}"
+          echo "version=${version}"
+          echo "tag=${tag}"
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "previous_tag=${previous_tag}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: build universal macos
+    needs: prepare
+    runs-on: macos-14
+    env:
+      TARGET: universal-apple-darwin
+
+    steps:
+      - name: checkout release base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base_sha }}
+
+      - name: apply release version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 .github/scripts/set-app-version.py "${VERSION}"
+
+      - name: set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+          run_install: false
+
+      - name: set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+
+      - name: install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: set up rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: cache rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: universal-apple-darwin
+
+      - name: clear stale bundle outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "target/${TARGET}/release/bundle"
+
+      - name: configure macos signing
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+
+          config_path="app/tauri.release-signing.conf.json"
+          cert_configured=false
+          notarization_configured=false
+          apple_id_auth_configured=false
+          api_key_auth_configured=false
+          api_key_path=""
+
+          add_env() {
+            name="$1"
+            value="$2"
+            delimiter="EOF_$(uuidgen | tr -d '-')"
+            {
+              echo "${name}<<${delimiter}"
+              printf '%s\n' "${value}"
+              echo "${delimiter}"
+            } >> "${GITHUB_ENV}"
+          }
+
+          if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            cert_configured=true
+          fi
+
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            apple_id_auth_configured=true
+            notarization_configured=true
+          fi
+
+          if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_P8:-}" ]; then
+            api_key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY}.p8"
+            printf '%s' "${APPLE_API_KEY_P8}" > "${api_key_path}"
+            chmod 600 "${api_key_path}"
+            api_key_auth_configured=true
+            notarization_configured=true
+          fi
+
+          if [ "${cert_configured}" = "true" ] && [ "${notarization_configured}" = "true" ]; then
+            add_env APPLE_CERTIFICATE "${APPLE_CERTIFICATE}"
+            add_env APPLE_CERTIFICATE_PASSWORD "${APPLE_CERTIFICATE_PASSWORD}"
+            add_env APPLE_SIGNING_IDENTITY "${APPLE_SIGNING_IDENTITY}"
+
+            if [ "${apple_id_auth_configured}" = "true" ]; then
+              add_env APPLE_ID "${APPLE_ID}"
+              add_env APPLE_PASSWORD "${APPLE_PASSWORD}"
+              add_env APPLE_TEAM_ID "${APPLE_TEAM_ID}"
+            elif [ "${api_key_auth_configured}" = "true" ]; then
+              add_env APPLE_API_KEY "${APPLE_API_KEY}"
+              add_env APPLE_API_ISSUER "${APPLE_API_ISSUER}"
+              add_env APPLE_API_KEY_PATH "${api_key_path}"
+            fi
+
+            python3 - "${config_path}" "${APPLE_SIGNING_IDENTITY}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          signing_identity = sys.argv[2]
+          path.write_text(json.dumps({"bundle": {"macOS": {"signingIdentity": signing_identity}}}) + "\n")
+          PY
+            echo "MACOS_SIGNING_MODE=developer-id" >> "${GITHUB_ENV}"
+            echo "using Developer ID signing and notarization"
+          else
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "main releases require Developer ID signing and notarization secrets" >&2
+              echo "required: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY" >&2
+              echo "and either APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID or APPLE_API_KEY + APPLE_API_ISSUER + APPLE_API_KEY_P8" >&2
+              exit 1
+            fi
+
+            python3 - "${config_path}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          path.write_text(json.dumps({"bundle": {"macOS": {"signingIdentity": "-"}}}) + "\n")
+          PY
+            echo "MACOS_SIGNING_MODE=ad-hoc" >> "${GITHUB_ENV}"
+            echo "using ad-hoc signing for branch test build; Gatekeeper will still warn"
+          fi
+
+      - name: build app bundle and dmg
+        working-directory: app
+        run: |
+          pnpm exec tauri build \
+            --ci \
+            --target "${TARGET}" \
+            --bundles app,dmg \
+            --config tauri.release-signing.conf.json
+
+      - name: notarize and staple dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${MACOS_SIGNING_MODE}" != "developer-id" ]; then
+            echo "skipping dmg notarization for ${MACOS_SIGNING_MODE} build"
+            exit 0
+          fi
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          dmg_dir="${bundle_dir}/dmg"
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          auth_args=()
+          if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            auth_args=(--apple-id "${APPLE_ID}" --password "${APPLE_PASSWORD}" --team-id "${APPLE_TEAM_ID}")
+          elif [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ] && [ -n "${APPLE_API_KEY_PATH:-}" ]; then
+            auth_args=(--key "${APPLE_API_KEY_PATH}" --key-id "${APPLE_API_KEY}" --issuer "${APPLE_API_ISSUER}")
+          else
+            echo "developer-id dmg notarization requires Apple ID or App Store Connect API credentials" >&2
+            exit 1
+          fi
+
+          echo "submitting ${dmg} for dmg notarization"
+          xcrun notarytool submit "${dmg}" "${auth_args[@]}" --wait
+          xcrun stapler staple "${dmg}"
+          xcrun stapler validate "${dmg}"
+
+      - name: verify app bundle and dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          app_bundle="${bundle_dir}/macos/socai.app"
+          dmg_dir="${bundle_dir}/dmg"
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ ! -d "${app_bundle}" ]; then
+            echo "no app bundle found at ${app_bundle}" >&2
+            exit 1
+          fi
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "${app_bundle}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            spctl -a -vvv -t execute "${app_bundle}"
+            xcrun stapler validate "${app_bundle}"
+          fi
+          hdiutil verify "${dmg}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            xcrun stapler validate "${dmg}"
+            spctl -a -vvv -t open --context context:primary-signature "${dmg}"
+          fi
+
+          mount_root="$(mktemp -d)"
+          mount_point=""
+          cleanup() {
+            if [ -n "${mount_point}" ]; then
+              hdiutil detach "${mount_point}" || true
+            fi
+            rm -rf "${mount_root}"
+          }
+          trap cleanup EXIT
+
+          attach_output="$(hdiutil attach -nobrowse -readonly -mountroot "${mount_root}" "${dmg}")"
+          echo "${attach_output}"
+          mount_point="$(echo "${attach_output}" | awk 'END { print $NF }')"
+          mounted_app="${mount_point}/socai.app"
+
+          codesign --verify --deep --strict --verbose=2 "${mounted_app}"
+          if [ "${MACOS_SIGNING_MODE}" = "developer-id" ]; then
+            spctl -a -vvv -t execute "${mounted_app}"
+            xcrun stapler validate "${mounted_app}"
+          fi
+
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${mounted_app}/Contents/Info.plist")"
+          binary="${mounted_app}/Contents/MacOS/${executable}"
+          actual_archs="$(lipo -archs "${binary}")"
+          echo "${binary} architectures: ${actual_archs}"
+
+          for expected_arch in arm64 x86_64; do
+            if [[ " ${actual_archs} " != *" ${expected_arch} "* ]]; then
+              echo "expected ${binary} to include ${expected_arch}, got: ${actual_archs}" >&2
+              exit 1
+            fi
+          done
+
+      - name: collect distributable artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          bundle_dir="target/${TARGET}/release/bundle"
+          dmg_dir="${bundle_dir}/dmg"
+          mkdir -p dist-artifacts
+
+          dmg="$(find "${dmg_dir}" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+
+          if [ -z "${dmg}" ]; then
+            echo "no dmg found in ${dmg_dir}" >&2
+            exit 1
+          fi
+
+          cp "${dmg}" "dist-artifacts/socai-macos-universal.dmg"
+
+          ls -lah dist-artifacts
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: socai-${{ needs.prepare.outputs.version }}-macos-universal
+          path: dist-artifacts/*
+          if-no-files-found: error
+
+  release:
+    name: publish github release
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: socai-${{ needs.prepare.outputs.version }}-macos-universal
+          merge-multiple: true
+          path: dist-artifacts
+
+      - name: publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+          BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+
+          current_main_sha="$(git rev-parse HEAD)"
+          if [ "${current_main_sha}" != "${BASE_SHA}" ]; then
+            echo "main moved while the release was building" >&2
+            echo "expected ${BASE_SHA}, got ${current_main_sha}" >&2
+            echo "rerun the release workflow from the latest main" >&2
+            exit 1
+          fi
+
+          artifact="dist-artifacts/socai-macos-universal.dmg"
+          if [ ! -f "${artifact}" ]; then
+            echo "missing release artifact: ${artifact}" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 .github/scripts/set-app-version.py "${VERSION}"
+
+          git add app/package.json app/src-tauri/tauri.conf.json app/src-tauri/Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "version files already up to date"
+          else
+            git commit -m "chore: release socai v${VERSION}"
+          fi
+
+          release_sha="$(git rev-parse HEAD)"
+          main_pushed=false
+          remote_tag_pushed=false
+          draft_release_created=false
+
+          cleanup() {
+            if [ "${main_pushed}" = "true" ]; then
+              echo "main was already updated; leaving release state for manual inspection" >&2
+              return
+            fi
+
+            if [ "${draft_release_created}" = "true" ]; then
+              gh release delete "${TAG}" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes || true
+            elif [ "${remote_tag_pushed}" = "true" ]; then
+              git push origin ":refs/tags/${TAG}" || true
+            fi
+          }
+          trap cleanup ERR
+
+          args=(-f "tag_name=${TAG}" -f "target_commitish=${BASE_SHA}")
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            args+=(-f "previous_tag_name=${PREVIOUS_TAG}")
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" "${args[@]}" --jq '.body' > generated-notes.md
+
+          cat > release-notes.md <<EOF
+          ## downloads
+
+          - [universal mac dmg](https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/socai-macos-universal.dmg) — supports Apple Silicon and Intel Macs.
+
+          This macOS build is signed and notarized.
+
+          ## changes
+
+          EOF
+          cat generated-notes.md >> release-notes.md
+
+          git tag "${TAG}" "${release_sha}"
+          git push origin "refs/tags/${TAG}"
+          remote_tag_pushed=true
+
+          gh release create "${TAG}" dist-artifacts/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --title "socai ${VERSION}" \
+            --notes-file release-notes.md
+          draft_release_created=true
+
+          git push origin HEAD:main
+          main_pushed=true
+
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
+
+          trap - ERR
+          cat release-notes.md
